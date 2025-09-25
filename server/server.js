@@ -1,39 +1,33 @@
-// server.js
+import dotenv from 'dotenv';
 import express from "express";
 import pg from "pg";
+
+dotenv.config();
 
 const app = express();
 app.use(express.json());
 
-// --- PostgreSQL (ใช้ Pool) ---
+const API_KEY = process.env.API_KEY;
+const PORT = process.env.PORT || 3000;
+
 const { Pool } = pg;
 const pool = new Pool({
-  host: "localhost",
-  user: "postgres",
-  password: "1234",
-  database: "pricescanDB",
-  port: 5432,          // สำคัญ: พอร์ต DB
-  max: 10,             // max connections
-  idleTimeoutMillis: 30000
+  host: process.env.PGHOST,
+  user: process.env.PGUSER,
+  password: process.env.PGPASSWORD,
+  database: process.env.PGDATABASE,
+  port: process.env.PGPORT     
 });
 
-// ทดสอบเชื่อม DB ตอนสตาร์ท
 (async () => {
   try {
     const { rows } = await pool.query("SELECT 1 AS ok");
     console.log("Connected to PostgreSQL. Smoke test:", rows[0]);
   } catch (err) {
     console.error("DB connect error at startup:", err);
-    // ถ้า DB ยังไม่ขึ้น ให้ process อยู่ต่อได้เพื่อยิง /health เช็คได้
   }
 })();
 
-// Health check
-app.get("/health", (req, res) => {
-  res.json({ ok: true });
-});
-
-// Login (POST + JSON body)
 app.post("/api/login", async (req, res, next) => {
   console.log("POST /api/login body:", req.body);
   try {
@@ -50,7 +44,6 @@ app.post("/api/login", async (req, res, next) => {
     }
     const user = rows[0];
 
-    // (ตัวอย่างเพื่อทดสอบ) เทียบรหัสแบบ plain-text ก่อน
     if (user.password !== password) {
       return res.status(401).json({ message: "Invalid password." });
     }
@@ -61,14 +54,85 @@ app.post("/api/login", async (req, res, next) => {
   }
 });
 
-// Error handler (กันเซิร์ฟเวอร์ล้ม -> กัน socket hang up)
-app.use((err, req, res, _next) => {
-  console.error("Unhandled error:", err);
-  if (res.headersSent) return;
-  res.status(500).json({ message: "Internal Server Error", error: err.message });
+const BASE_URL = "https://www.searchapi.io/api/v1/search";
+
+app.get("/api/search", async (req, res, next) => {
+  try {
+    const { query } = req.body;
+
+    if (!API_KEY) {
+      return res.status(500).json({ message: "Missing API_KEY env" });
+    }
+
+    const urlAmazon = `${BASE_URL}?engine=amazon_search&q=${encodeURIComponent(query)}&api_key=${API_KEY}`;
+    const urlWalmart = `${BASE_URL}?engine=walmart_search&q=${encodeURIComponent(query)}&api_key=${API_KEY}`;
+
+    const [amazonRes, walmartRes] = await Promise.all([
+      fetch(urlAmazon).then(r => {
+        if (!r.ok) throw new Error(`Amazon HTTP ${r.status}`);
+        return r.json();
+      }),
+      fetch(urlWalmart).then(r => {
+        if (!r.ok) throw new Error(`Walmart HTTP ${r.status}`);
+        return r.json();
+      }),
+    ]);
+
+    res.json({
+      product: query,
+      amazon: amazonRes,
+      walmart: walmartRes,
+    });
+
+    // ดึง ASIN ทั้งหมดจาก organic_results (เป็น array)
+    const amazonAsins = (amazonRes?.organic_results || [])
+      .map((item) => item.asin)
+      .filter(Boolean);
+
+    // (ตัวอย่าง) ลดข้อมูลให้เหลือฟิลด์สำคัญ
+    const amazonItems = (amazonRes?.organic_results || []).map((it) => ({
+      asin: it.asin,
+      title: it.title,
+      price: it.price,
+      rating: it.rating,
+      reviews: it.reviews,
+      link: it.link,
+    }));
+
+    const walmartItems = (walmartRes?.organic_results || []).map((it) => ({
+      id: it.us_item_id || it.item_id,
+      title: it.title,
+      price: it.price,
+      rating: it.rating,
+      reviews: it.reviews,
+      link: it.link,
+      seller: it.seller,
+    }));
+
+    // ส่งกลับ
+    res.json({
+      product: query,
+      amazon: {
+        count: amazonItems.length,
+        asins: amazonAsins,
+        items: amazonItems,
+        raw: amazonRes, // เอาออกถ้าไม่อยากส่งก้อนใหญ่
+      },
+      walmart: {
+        count: walmartItems.length,
+        items: walmartItems,
+        raw: walmartRes, // เอาออกถ้าไม่อยากส่งก้อนใหญ่
+      },
+    });
+
+    // log ASINs หลังส่ง response ได้ (ไม่แนะนำให้ทำงานหนักหลังส่ง)
+    console.log("Amazon ASINs:", amazonAsins);
+  } catch (err) {
+    console.error("search error:", err);
+    res.status(500).send(`ERROR: ${err.message}`);
+  }
 });
 
-const PORT = 3000;
 app.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);
 });
