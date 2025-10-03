@@ -1,11 +1,13 @@
 import dotenv from 'dotenv';
 import express from "express";
 import pg from "pg";
+import cors from "cors";
 
 dotenv.config();
 
 const app = express();
 app.use(express.json());
+app.use(cors());
 
 const API_KEY = process.env.API_KEY;
 const PORT = process.env.PORT || 3000;
@@ -16,7 +18,7 @@ const pool = new Pool({
   user: process.env.PGUSER,
   password: process.env.PGPASSWORD,
   database: process.env.PGDATABASE,
-  port: process.env.PGPORT     
+  port: process.env.PGPORT
 });
 
 (async () => {
@@ -54,84 +56,281 @@ app.post("/api/login", async (req, res, next) => {
   }
 });
 
-const BASE_URL = "https://www.searchapi.io/api/v1/search";
+const SEARCH_API_BASE = "https://www.searchapi.io/api/v1/search";
 
-app.get("/api/search", async (req, res, next) => {
+async function fetchJSON(url, { timeoutMs = 12000 } = {}) {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const { query } = req.body;
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`HTTP ${res.status}: ${text}`);
+    }
+    return await res.json();
+  } finally {
+    clearTimeout(id);
+  }
+}
 
-    if (!API_KEY) {
-      return res.status(500).json({ message: "Missing API_KEY env" });
+function buildUrl(params) {
+  const usp = new URLSearchParams({ ...params, api_key: API_KEY });
+  return `${SEARCH_API_BASE}?${usp.toString()}`;
+}
+
+function normalizeCurrency(value, currency) {
+  let num = Number(value);
+  if (Number.isNaN(num)) num = null;
+  return { value: num, currency: currency || "USD" };
+}
+
+function normalizeResult({ platform, rawSearch, rawProduct }) {
+  try {
+    if (platform === "walmart") {
+      // walmart_product returns { product: { ... } }
+      const s = rawSearch?.organic_results?.[0] || rawSearch?.products?.[0] || {};
+      const p = rawProduct?.product || rawProduct || {};  // <-- ALL product fields live here
+
+      const upc =
+        p.upc ||
+        (Array.isArray(p.specifications) &&
+          p.specifications.find(sp => (sp?.name || "").toLowerCase() === "upc")?.value) ||
+        (Array.isArray(s.specifications) &&
+          s.specifications.find(sp => (sp?.name || "").toLowerCase() === "upc")?.value) ||
+        null;
+
+      return {
+        platform: "walmart",
+        id: p.id,
+        upc,                                   // e.g. "195949704529"
+        title: p.title || p.product_title || s.product_title || s.title,
+        url: p.link || p.product_page_url || s.product_page_url || s.link,
+        image: p.main_image || (p.images && p.images[0]?.url) || s.product_photo || s.thumbnail,
+        price: normalizeCurrency(p.extracted_price ?? p.price, p.currency),
+        rating: p.rating || s.rating,
+        reviews_count: p.reviews || s.reviews || s.reviews_count,
+        seller: p.seller_name || p.seller?.name || s.seller,
+        condition: p.condition || s.condition,
+        availability: p.availability || s.availability,
+        shipping: p.fulfillment?.shipping?.is_free_fulfillment ? 0 : undefined,
+        delivery_estimate: p.fulfillment?.shipping?.expected_date,
+        product_raw: p,
+        raw: { search: rawSearch, product: rawProduct },
+      };
     }
 
-    const urlAmazon = `${BASE_URL}?engine=amazon_search&q=${encodeURIComponent(query)}&api_key=${API_KEY}`;
-    const urlWalmart = `${BASE_URL}?engine=walmart_search&q=${encodeURIComponent(query)}&api_key=${API_KEY}`;
+    if (platform === "amazon") {
+      const s = rawSearch?.organic_results?.[0] || rawSearch?.results?.[0] || {};
+      const p =
+      rawProduct?.product?.specifications ||
+      rawProduct?.specifications ||
+      rawSearch?.product?.specifications ||
+      rawSearch?.specifications ||
+      [];
 
-    const [amazonRes, walmartRes] = await Promise.all([
-      fetch(urlAmazon).then(r => {
-        if (!r.ok) throw new Error(`Amazon HTTP ${r.status}`);
-        return r.json();
-      }),
-      fetch(urlWalmart).then(r => {
-        if (!r.ok) throw new Error(`Walmart HTTP ${r.status}`);
-        return r.json();
-      }),
+    const upc =
+      (Array.isArray(p)
+        ? p.find(sp => (sp?.name || "").trim().toLowerCase() === "upc")?.value
+        : null);
+
+      return {
+        platform: "amazon",
+        id: s.asin || p.asin,
+        upc,
+        title: p.title || s.title,
+        url: p.product_page_url || s.link,
+        image: (p.images && p.images[0]) || s.thumbnail,
+        price: normalizeCurrency(p.price?.current_price ?? s.price_raw ?? s.price, p.price?.currency),
+        rating: p.rating || s.rating,
+        reviews_count: p.reviews_count || s.reviews_count,
+        seller: p.sold_by || p.merchant || s.seller,
+        condition: p.condition || s.condition,
+        availability: p.availability || s.availability,
+        shipping: p.shipping?.price || s.shipping,
+        delivery_estimate: p.delivery || s.delivery,
+        raw: { search: s, product: p },
+      };
+    }
+
+    if (platform === "ebay") {
+      const item = rawProduct?.item || rawSearch?.item || {};
+      const prod = rawProduct?.product || rawSearch?.product || {};
+      const s    = rawSearch?.organic_results?.[0] || rawSearch?.results?.[0] || {};
+
+      // Prefer item.specifications, then product.specifications; then try other spots
+      const upcRaw =
+        (Array.isArray(item.specifications) &&
+          item.specifications.find(sp => (sp?.name || "").trim().toLowerCase() === "upc")?.value) ||
+        (Array.isArray(prod.specifications) &&
+          prod.specifications.find(sp => (sp?.name || "").trim().toLowerCase() === "upc")?.value) ||
+        prod.global_ids?.upc ||
+        item.upc ||
+        s.upc ||
+        null;
+
+      // normalize to digits only (removes spaces/Unicode like \u200e)
+      const upc = upcRaw ? String(upcRaw).replace(/\D/g, "") || null : null;
+
+      return {
+        platform: "ebay",
+        id: item.item_id || prod.product_id || s.item_id,
+        upc, // -> "0194253397168"
+        title: item.title || prod.title || s.title,
+        url: rawSearch?.search_metadata?.request_url || item.item_web_url || s.link,
+        image: item.main_image || item.images?.[0]?.link || s.thumbnail,
+        price: normalizeCurrency(item.extracted_price ?? item.price ?? s.price_raw ?? s.price, "USD"),
+        rating: prod.rating || s.rating,
+        reviews_count: prod.reviews || s.reviews_count,
+        seller: item.seller?.name || s.seller,
+        condition: item.condition || s.condition,
+        availability: item.stock || s.availability,
+        raw: { search: rawSearch, product: rawProduct },
+      };
+    }
+
+
+
+    return { platform, error: "Unsupported platform" };
+  } catch (e) {
+    return { platform, error: e.message, raw: { search: rawSearch, product: rawProduct } };
+  }
+}
+
+app.get("/api/search", async (req, res) => {
+  try {
+    const q = (req.query.q || "").trim();
+    if (!q) return res.status(400).json({ error: "Missing query ?q" });
+    if (!API_KEY) return res.status(500).json({ error: "SEARCHAPI_API_KEY is not set" });
+
+
+    // 1) Run the three SEARCH calls in parallel
+    const [walmartSearch, amazonSearch, ebaySearch] = await Promise.all([
+      fetchJSON(buildUrl({ engine: "walmart_search", q })),
+      fetchJSON(buildUrl({ engine: "amazon_search", q })),
+      fetchJSON(buildUrl({ engine: "ebay_search", q })),
     ]);
 
-    res.json({
-      product: query,
-      amazon: amazonRes,
-      walmart: walmartRes,
-    });
 
-    // ดึง ASIN ทั้งหมดจาก organic_results (เป็น array)
-    const amazonAsins = (amazonRes?.organic_results || [])
-      .map((item) => item.asin)
-      .filter(Boolean);
+    // Extract IDs (defensively)
+    const walmartId = walmartSearch?.organic_results?.[0]?.id;
+      // || walmartSearch?.products?.[0]?.product_id
+      // || null;
 
-    // (ตัวอย่าง) ลดข้อมูลให้เหลือฟิลด์สำคัญ
-    const amazonItems = (amazonRes?.organic_results || []).map((it) => ({
-      asin: it.asin,
-      title: it.title,
-      price: it.price,
-      rating: it.rating,
-      reviews: it.reviews,
-      link: it.link,
-    }));
 
-    const walmartItems = (walmartRes?.organic_results || []).map((it) => ({
-      id: it.us_item_id || it.item_id,
-      title: it.title,
-      price: it.price,
-      rating: it.rating,
-      reviews: it.reviews,
-      link: it.link,
-      seller: it.seller,
-    }));
+    const amazonAsin = amazonSearch?.organic_results?.[0]?.asin;
+      // || amazonSearch?.results?.[0]?.asin
+      // || null;
 
-    // ส่งกลับ
-    res.json({
-      product: query,
-      amazon: {
-        count: amazonItems.length,
-        asins: amazonAsins,
-        items: amazonItems,
-        raw: amazonRes, // เอาออกถ้าไม่อยากส่งก้อนใหญ่
-      },
-      walmart: {
-        count: walmartItems.length,
-        items: walmartItems,
-        raw: walmartRes, // เอาออกถ้าไม่อยากส่งก้อนใหญ่
-      },
-    });
 
-    // log ASINs หลังส่ง response ได้ (ไม่แนะนำให้ทำงานหนักหลังส่ง)
-    console.log("Amazon ASINs:", amazonAsins);
+    const ebayItemId = ebaySearch?.organic_results?.[0]?.item_id;
+      // || ebaySearch?.results?.[0]?.item_id
+      // || null;
+
+
+    // 2) For each found ID, hit product endpoint (skip if not found)
+    const [walmartProduct, amazonProduct, ebayProduct] = await Promise.all([
+      walmartId ? fetchJSON(buildUrl({ engine: "walmart_product", product_id: walmartId })) : Promise.resolve(null),
+      amazonAsin ? fetchJSON(buildUrl({ engine: "amazon_product", asin: amazonAsin })) : Promise.resolve(null),
+      ebayItemId ? fetchJSON(buildUrl({ engine: "ebay_product", item_id: ebayItemId })) : Promise.resolve(null),
+    ]);
+
+
+    // 3) Normalize results
+    const payload = [
+      normalizeResult({ platform: "walmart", rawSearch: walmartSearch, rawProduct: walmartProduct }),
+      normalizeResult({ platform: "amazon", rawSearch: amazonSearch, rawProduct: amazonProduct }),
+      normalizeResult({ platform: "ebay", rawSearch: ebaySearch, rawProduct: ebayProduct }),
+    ];
+
+
+    res.json({ query: q, results: payload });
   } catch (err) {
-    console.error("search error:", err);
-    res.status(500).send(`ERROR: ${err.message}`);
+    console.error("/api/search error:", err);
+    res.status(500).json({ error: String(err?.message || err) });
   }
 });
+
+// const BASE_URL = "https://www.searchapi.io/api/v1/search";
+
+// app.get("/api/search", async (req, res, next) => {
+//   try {
+//     const { query } = req.body;
+
+//     if (!API_KEY) {
+//       return res.status(500).json({ message: "Missing API_KEY env" });
+//     }
+
+//     const urlAmazon = `${BASE_URL}?engine=amazon_search&q=${encodeURIComponent(query)}&api_key=${API_KEY}`;
+//     const urlWalmart = `${BASE_URL}?engine=walmart_search&q=${encodeURIComponent(query)}&api_key=${API_KEY}`;
+//     const urlEbay = `${BASE_URL}?engine=ebay_search&q=${encodeURIComponent(query)}&api_key=${API_KEY}`;
+
+//     const [amazonRes, walmartRes, ebayRes] = await Promise.all([
+//       fetch(urlAmazon).then(r => {
+//         if (!r.ok) throw new Error(`Amazon HTTP ${r.status}`);
+//         return r.json();
+//       }),
+//       fetch(urlWalmart).then(r => {
+//         if (!r.ok) throw new Error(`Walmart HTTP ${r.status}`);
+//         return r.json();
+//       }),
+//       fetch(urlEbay).then(r => {
+//         if (!r.ok) throw new Error(`eBay HTTP ${r.status}`);
+//         return r.json();
+//       }),
+//     ]);
+
+//     res.json({
+//       product: query,
+//       amazon: amazonRes,
+//       walmart: walmartRes,
+//       ebay: ebayRes,
+//     });
+
+//     const amazonAsins = (amazonRes?.organic_results || [])
+//       .map((item) => item.asin)
+//       .filter(Boolean);
+
+//     const amazonItems = (amazonRes?.organic_results || []).map((it) => ({
+//       asin: it.asin,
+//       title: it.title,
+//       price: it.price,
+//       rating: it.rating,
+//       reviews: it.reviews,
+//       link: it.link,
+//     }));
+
+//     const walmartItems = (walmartRes?.organic_results || []).map((it) => ({
+//       id: it.us_item_id || it.item_id,
+//       title: it.title,
+//       price: it.price,
+//       rating: it.rating,
+//       reviews: it.reviews,
+//       link: it.link,
+//       seller: it.seller,
+//     }));
+
+//     res.json({
+//       product: query,
+//       amazon: {
+//         count: amazonItems.length,
+//         asins: amazonAsins,
+//         items: amazonItems,
+//         raw: amazonRes, 
+//       },
+//       walmart: {
+//         count: walmartItems.length,
+//         items: walmartItems,
+//         raw: walmartRes, 
+//       },
+//     });
+
+//     console.log("Amazon ASINs:", amazonAsins);
+//   } catch (err) {
+//     console.error("search error:", err);
+//     res.status(500).send(`ERROR: ${err.message}`);
+//   }
+// });
+
 
 app.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);
