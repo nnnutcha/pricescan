@@ -84,12 +84,18 @@ function normalizeCurrency(value, currency) {
   return { value: num, currency: currency || "USD" };
 }
 
+function normalizeDate(d) {
+  if (!d || typeof d !== "string") return null;
+  const parsed = new Date(d);
+  return isNaN(parsed.getTime()) ? d : parsed.toISOString();
+}
+
 function normalizeResult({ platform, rawSearch, rawProduct }) {
   try {
     if (platform === "walmart") {
-      // walmart_product returns { product: { ... } }
       const s = rawSearch?.organic_results?.[0] || rawSearch?.products?.[0] || {};
-      const p = rawProduct?.product || rawProduct || {};  // <-- ALL product fields live here
+      const p = rawProduct?.product || rawProduct || {};
+      const r = rawProduct?.reviews?.customer_reviews || [];
 
       const upc =
         p.upc ||
@@ -101,94 +107,155 @@ function normalizeResult({ platform, rawSearch, rawProduct }) {
 
       return {
         platform: "walmart",
-        id: p.id,
-        upc,                                   // e.g. "195949704529"
+        id: p.id || s.product_id || s.id || p.product_id,
+        upc,
         title: p.title || p.product_title || s.product_title || s.title,
         url: p.link || p.product_page_url || s.product_page_url || s.link,
-        image: p.main_image || (p.images && p.images[0]?.url) || s.product_photo || s.thumbnail,
-        price: normalizeCurrency(p.extracted_price ?? p.price, p.currency),
-        rating: p.rating || s.rating,
-        reviews_count: p.reviews || s.reviews || s.reviews_count,
-        seller: p.seller_name || p.seller?.name || s.seller,
-        condition: p.condition || s.condition,
-        availability: p.availability || s.availability,
-        shipping: p.fulfillment?.shipping?.is_free_fulfillment ? 0 : undefined,
-        delivery_estimate: p.fulfillment?.shipping?.expected_date,
-        product_raw: p,
-        raw: { search: rawSearch, product: rawProduct },
+        image:
+          p.main_image ||
+          (p.images && (p.images[0]?.url || p.images[0])) ||
+          s.product_photo ||
+          s.thumbnail,
+
+        product_offers: Array.isArray(rawSearch?.organic_results)
+          ? rawSearch.organic_results
+              .map(item => ({
+                id: item?.id ?? item?.product_id ?? null,
+                seller_name: item?.seller_name ?? null,
+                rating: typeof item?.rating === "number" ? item.rating : null,
+                condition: item?.condition ?? (item?.is_preowned ? "Pre-Owned" : null),
+                link: item?.link ?? null,
+                extracted_price: typeof item?.extracted_price === "number" ? item.extracted_price : null,
+                extracted_original_price: typeof item?.extracted_original_price === "number" ? item.extracted_original_price : null,
+              }))
+              .filter(offer =>
+                offer.seller_name &&
+                offer.link &&
+                (offer.extracted_price !== null || offer.extracted_original_price !== null)
+              )
+              .filter((offer, index, arr) =>
+                index === arr.findIndex(o =>
+                  o.seller_name === offer.seller_name &&
+                  o.condition === offer.condition &&
+                  o.link === offer.link
+                )
+              )
+          : [],
+
+        reviews: r.map(review => ({
+          text: review?.text ?? "",
+          rating: typeof review?.rating === "number" ? review.rating : null,
+          date: normalizeDate(review?.date),
+          user_name: review?.user_name ?? "Anonymous",
+          fullfilled_by: review?.fullfilled_by ?? "N/A",
+        })),
       };
     }
 
     if (platform === "amazon") {
-      const s = rawSearch?.organic_results?.[0] || rawSearch?.results?.[0] || {};
-      const p =
-      rawProduct?.product?.specifications ||
-      rawProduct?.specifications ||
-      rawSearch?.product?.specifications ||
-      rawSearch?.specifications ||
-      [];
+      const s = rawSearch?.organic_results?.[0] || {};
+      const p = rawProduct?.product || rawProduct || {};
+      const r = rawProduct?.review_results?.local || [];
 
-    const upc =
-      (Array.isArray(p)
-        ? p.find(sp => (sp?.name || "").trim().toLowerCase() === "upc")?.value
-        : null);
+      const upc =
+        p.upc ||
+        (Array.isArray(p.specifications) &&
+          p.specifications.find(sp => (sp?.name || "").toLowerCase() === "upc")?.value) ||
+        (Array.isArray(s.specifications) &&
+          s.specifications.find(sp => (sp?.name || "").toLowerCase() === "upc")?.value) ||
+        null;
 
       return {
         platform: "amazon",
-        id: s.asin || p.asin,
+        id: p.id || s.product_id || s.id || p.product_id,
         upc,
-        title: p.title || s.title,
-        url: p.product_page_url || s.link,
-        image: (p.images && p.images[0]) || s.thumbnail,
-        price: normalizeCurrency(p.price?.current_price ?? s.price_raw ?? s.price, p.price?.currency),
-        rating: p.rating || s.rating,
-        reviews_count: p.reviews_count || s.reviews_count,
-        seller: p.sold_by || p.merchant || s.seller,
-        condition: p.condition || s.condition,
-        availability: p.availability || s.availability,
-        shipping: p.shipping?.price || s.shipping,
-        delivery_estimate: p.delivery || s.delivery,
-        raw: { search: s, product: p },
+        title: p.title || p.product_title || s.product_title || s.title,
+        url: p.link || p.product_page_url || s.product_page_url || s.link,
+        image:
+          p.main_image ||
+          (p.images && (p.images[0]?.url || p.images[0])) ||
+          s.product_photo ||
+          s.thumbnail,
+
+        // product_offers: Array.isArray(rawSearch?.organic_results)
+        //   ? rawSearch.organic_results
+        //       .map(item => ({
+        //         id: item?.id ?? item?.product_id ?? null,
+        //         seller_name: item?.seller_name ?? null,
+        //         rating: typeof item?.rating === "number" ? item.rating : null,
+        //         condition: item?.condition ?? (item?.is_preowned ? "Pre-Owned" : null),
+        //         link: item?.link ?? null,
+        //         extracted_price: typeof item?.extracted_price === "number" ? item.extracted_price : null,
+        //         extracted_original_price: typeof item?.extracted_original_price === "number" ? item.extracted_original_price : null,
+        //       }))
+        //       .filter(offer =>
+        //         offer.seller_name &&
+        //         offer.link &&
+        //         (offer.extracted_price !== null || offer.extracted_original_price !== null)
+        //       )
+        //       .filter((offer, index, arr) =>
+        //         index === arr.findIndex(o =>
+        //           o.seller_name === offer.seller_name &&
+        //           o.condition === offer.condition &&
+        //           o.link === offer.link
+        //         )
+        //       )
+        //   : [],
+
+        // reviews: r.map(review => ({
+        //   text: review?.text ?? "",
+        //   rating: typeof review?.rating === "number" ? review.rating : null,
+        //   extracted_date: extracted_date,
+        //   user_name: review?.user_name ?? "Anonymous",
+        //   fullfilled_by: review?.fullfilled_by ?? "N/A",
+        // })),
+        reviews: Array.isArray(r)
+          ? r.map(review => ({
+              text: review?.text ?? "",
+              rating: typeof review?.rating === "number" ? review.rating : null,
+              date: normalizeDate(review?.extracted_date || review?.date),
+              user_name: review?.profile?.name ?? "Anonymous",
+              fullfilled_by: "Amazon",
+            }))
+          : [],
       };
     }
 
-    if (platform === "ebay") {
-      const item = rawProduct?.item || rawSearch?.item || {};
-      const prod = rawProduct?.product || rawSearch?.product || {};
-      const s    = rawSearch?.organic_results?.[0] || rawSearch?.results?.[0] || {};
+    // if (platform === "ebay") {
+    //   const item = rawProduct?.item || rawSearch?.item || {};
+    //   const prod = rawProduct?.product || rawSearch?.product || {};
+    //   const s    = rawSearch?.organic_results?.[0] || rawSearch?.results?.[0] || {};
 
-      // Prefer item.specifications, then product.specifications; then try other spots
-      const upcRaw =
-        (Array.isArray(item.specifications) &&
-          item.specifications.find(sp => (sp?.name || "").trim().toLowerCase() === "upc")?.value) ||
-        (Array.isArray(prod.specifications) &&
-          prod.specifications.find(sp => (sp?.name || "").trim().toLowerCase() === "upc")?.value) ||
-        prod.global_ids?.upc ||
-        item.upc ||
-        s.upc ||
-        null;
+    //   // Prefer item.specifications, then product.specifications; then try other spots
+    //   const upcRaw =
+    //     (Array.isArray(item.specifications) &&
+    //       item.specifications.find(sp => (sp?.name || "").trim().toLowerCase() === "upc")?.value) ||
+    //     (Array.isArray(prod.specifications) &&
+    //       prod.specifications.find(sp => (sp?.name || "").trim().toLowerCase() === "upc")?.value) ||
+    //     prod.global_ids?.upc ||
+    //     item.upc ||
+    //     s.upc ||
+    //     null;
 
-      // normalize to digits only (removes spaces/Unicode like \u200e)
-      const upc = upcRaw ? String(upcRaw).replace(/\D/g, "") || null : null;
+    //   // normalize to digits only (removes spaces/Unicode like \u200e)
+    //   const upc = upcRaw ? String(upcRaw).replace(/\D/g, "") || null : null;
 
-      return {
-        platform: "ebay",
-        id: item.item_id || prod.product_id || s.item_id,
-        upc, // -> "0194253397168"
-        title: item.title || prod.title || s.title,
-        url: rawSearch?.search_metadata?.request_url || item.item_web_url || s.link,
-        image: item.main_image || item.images?.[0]?.link || s.thumbnail,
-        price: normalizeCurrency(item.extracted_price ?? item.price ?? s.price_raw ?? s.price, "USD"),
-        rating: prod.rating || s.rating,
-        reviews_count: prod.reviews || s.reviews_count,
-        seller: item.seller?.name || s.seller,
-        condition: item.condition || s.condition,
-        availability: item.stock || s.availability,
-        raw: { search: rawSearch, product: rawProduct },
-      };
-    }
-
-
+    //   return {
+    //     platform: "ebay",
+    //     id: item.item_id || prod.product_id || s.item_id,
+    //     upc, // -> "0194253397168"
+    //     title: item.title || prod.title || s.title,
+    //     url: rawSearch?.search_metadata?.request_url || item.item_web_url || s.link,
+    //     image: item.main_image || item.images?.[0]?.link || s.thumbnail,
+    //     price: normalizeCurrency(item.extracted_price ?? item.price ?? s.price_raw ?? s.price, "USD"),
+    //     rating: prod.rating || s.rating,
+    //     reviews_count: prod.reviews || s.reviews_count,
+    //     seller: item.seller?.name || s.seller,
+    //     condition: item.condition || s.condition,
+    //     availability: item.stock || s.availability,
+    //     raw: { search: rawSearch, product: rawProduct },
+    //   };
+    // }
 
     return { platform, error: "Unsupported platform" };
   } catch (e) {
@@ -205,41 +272,41 @@ app.get("/api/search", async (req, res) => {
 
     // 1) Run the three SEARCH calls in parallel
     const [walmartSearch, amazonSearch, ebaySearch] = await Promise.all([
-      fetchJSON(buildUrl({ engine: "walmart_search", q })),
+      // fetchJSON(buildUrl({ engine: "walmart_search", q })),
       fetchJSON(buildUrl({ engine: "amazon_search", q })),
-      fetchJSON(buildUrl({ engine: "ebay_search", q })),
+      // fetchJSON(buildUrl({ engine: "ebay_search", q })),
     ]);
 
 
     // Extract IDs (defensively)
     const walmartId = walmartSearch?.organic_results?.[0]?.id;
-      // || walmartSearch?.products?.[0]?.product_id
-      // || null;
+    // || walmartSearch?.products?.[0]?.product_id
+    // || null;
 
 
     const amazonAsin = amazonSearch?.organic_results?.[0]?.asin;
-      // || amazonSearch?.results?.[0]?.asin
-      // || null;
+    // || amazonSearch?.results?.[0]?.asin
+    // || null;
 
 
     const ebayItemId = ebaySearch?.organic_results?.[0]?.item_id;
-      // || ebaySearch?.results?.[0]?.item_id
-      // || null;
+    // || ebaySearch?.results?.[0]?.item_id
+    // || null;
 
 
     // 2) For each found ID, hit product endpoint (skip if not found)
     const [walmartProduct, amazonProduct, ebayProduct] = await Promise.all([
-      walmartId ? fetchJSON(buildUrl({ engine: "walmart_product", product_id: walmartId })) : Promise.resolve(null),
+      // walmartId ? fetchJSON(buildUrl({ engine: "walmart_product", product_id: walmartId })) : Promise.resolve(null),
       amazonAsin ? fetchJSON(buildUrl({ engine: "amazon_product", asin: amazonAsin })) : Promise.resolve(null),
-      ebayItemId ? fetchJSON(buildUrl({ engine: "ebay_product", item_id: ebayItemId })) : Promise.resolve(null),
+      // ebayItemId ? fetchJSON(buildUrl({ engine: "ebay_product", item_id: ebayItemId })) : Promise.resolve(null),
     ]);
 
 
     // 3) Normalize results
     const payload = [
-      normalizeResult({ platform: "walmart", rawSearch: walmartSearch, rawProduct: walmartProduct }),
+      // normalizeResult({ platform: "walmart", rawSearch: walmartSearch, rawProduct: walmartProduct }),
       normalizeResult({ platform: "amazon", rawSearch: amazonSearch, rawProduct: amazonProduct }),
-      normalizeResult({ platform: "ebay", rawSearch: ebaySearch, rawProduct: ebayProduct }),
+      // normalizeResult({ platform: "ebay", rawSearch: ebaySearch, rawProduct: ebayProduct }),
     ];
 
 
